@@ -119,7 +119,7 @@ export default function AdminOrders() {
       if (exportMode === "selection") {
         const slotCount = itemLimit > 0 ? itemLimit : Math.max(...cycleOrders.map(o => (o.items?.filter(i => i.group_name_snapshot === groupName) || []).reduce((sum, it) => sum + it.quantity, 0)), 1);
         const slotHeaders = Array.from({ length: slotCount }, (_, i) => `Item ${i + 1}`);
-        headers = ["Matrícula", "Nome", ...slotHeaders, "Valor Total", "Distribuição"];
+        headers = ["Matrícula", "Nome", "Setor", ...slotHeaders, "Valor Total", "Distribuição"];
 
         for (const order of cycleOrders) {
           const emp = employees.find(e => e.id === order.employee_id);
@@ -139,6 +139,7 @@ export default function AdminOrders() {
           const row: any[] = [
             order.employee_registration || emp?.registration_number || "",
             order.employee_name || emp?.name || "",
+            emp?.setor || "",
           ];
           for (let s = 0; s < slotCount; s++) {
             row.push(selectedProducts[s] || "");
@@ -187,7 +188,7 @@ export default function AdminOrders() {
       const colWidths = headers.map((h, i) => {
         if (i === 0) return { wch: 12 };
         if (i === 1) return { wch: 30 };
-        if (exportMode === "quantity" && i === 2) return { wch: 18 };
+        if (i === 2) return { wch: 18 };
         if (i === totalColIdx) return { wch: 14 };
         if (exportMode === "selection" && i === headers.length - 1) return { wch: 18 };
         return { wch: Math.max(h.length + 2, 10) };
