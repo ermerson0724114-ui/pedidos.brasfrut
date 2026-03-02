@@ -1,9 +1,32 @@
 import { useState, useRef, useCallback, useEffect } from "react";
-import { Camera, RefreshCw, Check, X, AlertCircle } from "lucide-react";
+import { Camera, RefreshCw, Check, X, AlertCircle, Loader2 } from "lucide-react";
+import { FaceDetector, FilesetResolver } from "@mediapipe/tasks-vision";
 
 interface SelfieCaptureProps {
   onCapture: (base64: string) => void;
   onCancel: () => void;
+}
+
+let mediapipeDetectorPromise: Promise<FaceDetector> | null = null;
+
+function getMediaPipeDetector(): Promise<FaceDetector> {
+  if (!mediapipeDetectorPromise) {
+    mediapipeDetectorPromise = (async () => {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+      );
+      return FaceDetector.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath:
+            "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite",
+          delegate: "GPU",
+        },
+        runningMode: "IMAGE",
+        minDetectionConfidence: 0.5,
+      });
+    })();
+  }
+  return mediapipeDetectorPromise;
 }
 
 export default function SelfieCapture({ onCapture, onCancel }: SelfieCaptureProps) {
@@ -15,7 +38,10 @@ export default function SelfieCapture({ onCapture, onCancel }: SelfieCaptureProp
   const [faceDetected, setFaceDetected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [detecting, setDetecting] = useState(false);
-  const detectorRef = useRef<any>(null);
+  const [modelLoading, setModelLoading] = useState(true);
+  const [validatingCapture, setValidatingCapture] = useState(false);
+  const [captureValid, setCaptureValid] = useState<boolean | null>(null);
+  const detectorRef = useRef<FaceDetector | null>(null);
   const animFrameRef = useRef<number>(0);
 
   const startCamera = useCallback(async () => {
@@ -58,30 +84,50 @@ export default function SelfieCapture({ onCapture, onCancel }: SelfieCaptureProp
 
   useEffect(() => {
     startCamera();
-    if ("FaceDetector" in window) {
-      try {
-        detectorRef.current = new (window as any).FaceDetector({ fastMode: true, maxDetectedFaces: 1 });
-      } catch {
-        detectorRef.current = null;
-      }
-    }
+
+    setModelLoading(true);
+    getMediaPipeDetector()
+      .then((detector) => {
+        detectorRef.current = detector;
+        setModelLoading(false);
+      })
+      .catch((err) => {
+        console.error("MediaPipe FaceDetector failed to load:", err);
+        setModelLoading(false);
+        setError("Erro ao carregar detector facial. Recarregue a página.");
+      });
+
     return () => stopCamera();
   }, [startCamera, stopCamera]);
 
   useEffect(() => {
-    if (!cameraReady || capturedImage) return;
+    if (!cameraReady || capturedImage || !detectorRef.current || modelLoading) return;
 
     let running = true;
 
     const detectFaces = async () => {
-      if (!running || !videoRef.current) return;
+      if (!running || !videoRef.current || !canvasRef.current || !detectorRef.current) return;
 
-      if (detectorRef.current && videoRef.current.readyState >= 2) {
+      if (videoRef.current.readyState >= 2) {
         try {
-          const faces = await detectorRef.current.detect(videoRef.current);
-          if (running) {
-            setFaceDetected(faces.length > 0);
-            setDetecting(true);
+          const video = videoRef.current;
+          const tmpCanvas = canvasRef.current;
+          tmpCanvas.width = video.videoWidth;
+          tmpCanvas.height = video.videoHeight;
+          const ctx = tmpCanvas.getContext("2d");
+          if (ctx) {
+            ctx.save();
+            ctx.translate(tmpCanvas.width, 0);
+            ctx.scale(-1, 1);
+            ctx.drawImage(video, 0, 0);
+            ctx.restore();
+
+            const result = detectorRef.current.detect(tmpCanvas);
+            if (running) {
+              const hasFace = result.detections.length > 0;
+              setFaceDetected(hasFace);
+              setDetecting(true);
+            }
           }
         } catch {
           if (running) {
@@ -89,25 +135,46 @@ export default function SelfieCapture({ onCapture, onCancel }: SelfieCaptureProp
             setDetecting(true);
           }
         }
-      } else if (!detectorRef.current) {
-        if (running) {
-          setDetecting(false);
-          setFaceDetected(false);
-        }
       }
 
       if (running) {
         animFrameRef.current = requestAnimationFrame(() => {
-          setTimeout(detectFaces, 300);
+          setTimeout(detectFaces, 400);
         });
       }
     };
 
     detectFaces();
     return () => { running = false; };
-  }, [cameraReady, capturedImage]);
+  }, [cameraReady, capturedImage, modelLoading]);
 
-  const handleCapture = () => {
+  const validateCapturedImage = useCallback(async (imageBase64: string): Promise<boolean> => {
+    const detector = detectorRef.current;
+    if (!detector) return false;
+
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const tmpCanvas = document.createElement("canvas");
+          tmpCanvas.width = img.width;
+          tmpCanvas.height = img.height;
+          const ctx = tmpCanvas.getContext("2d");
+          if (!ctx) { resolve(false); return; }
+          ctx.drawImage(img, 0, 0);
+
+          const result = detector.detect(tmpCanvas);
+          resolve(result.detections.length > 0);
+        } catch {
+          resolve(false);
+        }
+      };
+      img.onerror = () => resolve(false);
+      img.src = imageBase64;
+    });
+  }, []);
+
+  const handleCapture = async () => {
     if (!videoRef.current || !canvasRef.current) return;
     const video = videoRef.current;
     const canvas = canvasRef.current;
@@ -118,24 +185,33 @@ export default function SelfieCapture({ onCapture, onCancel }: SelfieCaptureProp
     ctx.scale(-1, 1);
     ctx.drawImage(video, 0, 0);
     const base64 = canvas.toDataURL("image/jpeg", 0.8);
+
     setCapturedImage(base64);
     stopCamera();
+
+    setValidatingCapture(true);
+    setCaptureValid(null);
+    const isValid = await validateCapturedImage(base64);
+    setCaptureValid(isValid);
+    setValidatingCapture(false);
   };
 
   const handleRetake = () => {
     setCapturedImage(null);
     setFaceDetected(false);
     setDetecting(false);
+    setCaptureValid(null);
+    setValidatingCapture(false);
     startCamera();
   };
 
   const handleConfirm = () => {
-    if (capturedImage) {
+    if (capturedImage && captureValid) {
       onCapture(capturedImage);
     }
   };
 
-  const canCapture = detecting ? faceDetected : true;
+  const isReady = cameraReady && !modelLoading && detectorRef.current !== null;
 
   return (
     <div className="space-y-4">
@@ -147,14 +223,14 @@ export default function SelfieCapture({ onCapture, onCancel }: SelfieCaptureProp
       </div>
 
       <p className="text-xs text-gray-500">
-        Tire uma foto do seu rosto para comprovar sua identidade. Posicione seu rosto dentro do guia.
+        Tire uma foto do seu rosto para comprovar sua identidade. Posicione seu rosto dentro do guia oval.
       </p>
 
       {error ? (
         <div className="bg-red-50 border border-red-200 rounded-2xl p-4 text-center">
           <AlertCircle size={32} className="text-red-400 mx-auto mb-2" />
           <p className="text-sm text-red-700 font-medium">{error}</p>
-          <button onClick={startCamera}
+          <button onClick={() => { setError(null); startCamera(); }}
             className="mt-3 px-4 py-2 bg-red-100 text-red-700 rounded-xl text-sm font-semibold"
             data-testid="button-retry-camera">
             Tentar novamente
@@ -164,6 +240,28 @@ export default function SelfieCapture({ onCapture, onCancel }: SelfieCaptureProp
         <div className="space-y-3">
           <div className="relative rounded-2xl overflow-hidden bg-black">
             <img src={capturedImage} alt="Selfie capturada" className="w-full" data-testid="img-captured-selfie" />
+            {validatingCapture && (
+              <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
+                <div className="text-center">
+                  <div className="animate-spin w-8 h-8 border-4 border-white/20 border-t-white rounded-full mx-auto mb-2" />
+                  <p className="text-white text-xs font-medium">Verificando rosto...</p>
+                </div>
+              </div>
+            )}
+            {captureValid === false && !validatingCapture && (
+              <div className="absolute inset-0 bg-red-900/40 flex items-center justify-center">
+                <div className="bg-white rounded-2xl p-4 mx-4 text-center shadow-lg">
+                  <AlertCircle size={32} className="text-red-500 mx-auto mb-2" />
+                  <p className="text-sm font-bold text-red-700">Rosto não detectado</p>
+                  <p className="text-xs text-gray-500 mt-1">A foto precisa mostrar claramente o rosto de uma pessoa. Tente novamente com boa iluminação.</p>
+                </div>
+              </div>
+            )}
+            {captureValid === true && !validatingCapture && (
+              <div className="absolute bottom-3 left-1/2 -translate-x-1/2 px-3 py-1 rounded-full text-xs font-medium bg-green-500/90 text-white">
+                Rosto verificado ✓
+              </div>
+            )}
           </div>
           <div className="flex gap-3">
             <button onClick={handleRetake}
@@ -173,7 +271,8 @@ export default function SelfieCapture({ onCapture, onCancel }: SelfieCaptureProp
               Tirar outra
             </button>
             <button onClick={handleConfirm}
-              className="flex-1 py-3 bg-green-900 text-white rounded-2xl font-bold flex items-center justify-center gap-2"
+              disabled={!captureValid || validatingCapture}
+              className="flex-1 py-3 bg-green-900 text-white rounded-2xl font-bold flex items-center justify-center gap-2 disabled:opacity-40 transition-all"
               data-testid="button-confirm-selfie">
               <Check size={16} />
               Confirmar
@@ -198,16 +297,18 @@ export default function SelfieCapture({ onCapture, onCancel }: SelfieCaptureProp
               } transition-colors duration-300`} />
             </div>
 
-            {!cameraReady && (
+            {(!cameraReady || modelLoading) && (
               <div className="absolute inset-0 bg-gray-900 flex items-center justify-center">
                 <div className="text-center">
-                  <div className="animate-spin w-8 h-8 border-4 border-white/20 border-t-white rounded-full mx-auto mb-2" />
-                  <p className="text-white/60 text-xs">Iniciando câmera...</p>
+                  <Loader2 size={32} className="animate-spin text-white mx-auto mb-2" />
+                  <p className="text-white/60 text-xs">
+                    {modelLoading ? "Carregando detector facial..." : "Iniciando câmera..."}
+                  </p>
                 </div>
               </div>
             )}
 
-            {cameraReady && detecting && (
+            {isReady && detecting && (
               <div className={`absolute bottom-3 left-1/2 -translate-x-1/2 px-3 py-1 rounded-full text-xs font-medium ${
                 faceDetected ? "bg-green-500/90 text-white" : "bg-red-500/90 text-white"
               }`}>
@@ -218,12 +319,12 @@ export default function SelfieCapture({ onCapture, onCancel }: SelfieCaptureProp
 
           <button
             onClick={handleCapture}
-            disabled={!cameraReady || !canCapture}
+            disabled={!isReady || !faceDetected}
             className="w-full py-3.5 bg-green-900 text-white rounded-2xl font-bold flex items-center justify-center gap-2 disabled:opacity-40 transition-all active:scale-[0.98]"
             data-testid="button-capture-selfie"
           >
             <Camera size={18} />
-            {detecting && !faceDetected ? "Posicione seu rosto para capturar" : "Capturar foto"}
+            {modelLoading ? "Carregando..." : !faceDetected ? "Posicione seu rosto para capturar" : "Capturar foto"}
           </button>
         </div>
       )}
