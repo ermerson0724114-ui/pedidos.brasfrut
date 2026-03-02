@@ -1,0 +1,234 @@
+import { useState, useRef, useCallback, useEffect } from "react";
+import { Camera, RefreshCw, Check, X, AlertCircle } from "lucide-react";
+
+interface SelfieCaptureProps {
+  onCapture: (base64: string) => void;
+  onCancel: () => void;
+}
+
+export default function SelfieCapture({ onCapture, onCancel }: SelfieCaptureProps) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const [cameraReady, setCameraReady] = useState(false);
+  const [capturedImage, setCapturedImage] = useState<string | null>(null);
+  const [faceDetected, setFaceDetected] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [detecting, setDetecting] = useState(false);
+  const detectorRef = useRef<any>(null);
+  const animFrameRef = useRef<number>(0);
+
+  const startCamera = useCallback(async () => {
+    try {
+      setError(null);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
+        audio: false,
+      });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        videoRef.current.onloadedmetadata = () => {
+          videoRef.current?.play();
+          setCameraReady(true);
+        };
+      }
+    } catch (err: any) {
+      if (err.name === "NotAllowedError") {
+        setError("Acesso à câmera negado. Permita o acesso para continuar.");
+      } else if (err.name === "NotFoundError") {
+        setError("Nenhuma câmera encontrada neste dispositivo.");
+      } else {
+        setError("Erro ao acessar a câmera. Verifique as permissões.");
+      }
+    }
+  }, []);
+
+  const stopCamera = useCallback(() => {
+    if (animFrameRef.current) {
+      cancelAnimationFrame(animFrameRef.current);
+      animFrameRef.current = 0;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop());
+      streamRef.current = null;
+    }
+    setCameraReady(false);
+  }, []);
+
+  useEffect(() => {
+    startCamera();
+    if ("FaceDetector" in window) {
+      try {
+        detectorRef.current = new (window as any).FaceDetector({ fastMode: true, maxDetectedFaces: 1 });
+      } catch {
+        detectorRef.current = null;
+      }
+    }
+    return () => stopCamera();
+  }, [startCamera, stopCamera]);
+
+  useEffect(() => {
+    if (!cameraReady || capturedImage) return;
+
+    let running = true;
+
+    const detectFaces = async () => {
+      if (!running || !videoRef.current) return;
+
+      if (detectorRef.current && videoRef.current.readyState >= 2) {
+        try {
+          const faces = await detectorRef.current.detect(videoRef.current);
+          if (running) {
+            setFaceDetected(faces.length > 0);
+            setDetecting(true);
+          }
+        } catch {
+          if (running) {
+            setFaceDetected(false);
+            setDetecting(true);
+          }
+        }
+      } else if (!detectorRef.current) {
+        if (running) {
+          setDetecting(false);
+          setFaceDetected(false);
+        }
+      }
+
+      if (running) {
+        animFrameRef.current = requestAnimationFrame(() => {
+          setTimeout(detectFaces, 300);
+        });
+      }
+    };
+
+    detectFaces();
+    return () => { running = false; };
+  }, [cameraReady, capturedImage]);
+
+  const handleCapture = () => {
+    if (!videoRef.current || !canvasRef.current) return;
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext("2d")!;
+    ctx.translate(canvas.width, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(video, 0, 0);
+    const base64 = canvas.toDataURL("image/jpeg", 0.8);
+    setCapturedImage(base64);
+    stopCamera();
+  };
+
+  const handleRetake = () => {
+    setCapturedImage(null);
+    setFaceDetected(false);
+    setDetecting(false);
+    startCamera();
+  };
+
+  const handleConfirm = () => {
+    if (capturedImage) {
+      onCapture(capturedImage);
+    }
+  };
+
+  const canCapture = detecting ? faceDetected : true;
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between mb-1">
+        <h3 className="font-bold text-gray-800 text-sm">Verificação por foto</h3>
+        <button onClick={onCancel} className="w-7 h-7 bg-gray-100 rounded-full flex items-center justify-center" data-testid="button-cancel-selfie">
+          <X size={14} />
+        </button>
+      </div>
+
+      <p className="text-xs text-gray-500">
+        Tire uma foto do seu rosto para comprovar sua identidade. Posicione seu rosto dentro do guia.
+      </p>
+
+      {error ? (
+        <div className="bg-red-50 border border-red-200 rounded-2xl p-4 text-center">
+          <AlertCircle size={32} className="text-red-400 mx-auto mb-2" />
+          <p className="text-sm text-red-700 font-medium">{error}</p>
+          <button onClick={startCamera}
+            className="mt-3 px-4 py-2 bg-red-100 text-red-700 rounded-xl text-sm font-semibold"
+            data-testid="button-retry-camera">
+            Tentar novamente
+          </button>
+        </div>
+      ) : capturedImage ? (
+        <div className="space-y-3">
+          <div className="relative rounded-2xl overflow-hidden bg-black">
+            <img src={capturedImage} alt="Selfie capturada" className="w-full" data-testid="img-captured-selfie" />
+          </div>
+          <div className="flex gap-3">
+            <button onClick={handleRetake}
+              className="flex-1 py-3 border border-gray-200 rounded-2xl font-semibold text-gray-600 flex items-center justify-center gap-2"
+              data-testid="button-retake-selfie">
+              <RefreshCw size={16} />
+              Tirar outra
+            </button>
+            <button onClick={handleConfirm}
+              className="flex-1 py-3 bg-green-900 text-white rounded-2xl font-bold flex items-center justify-center gap-2"
+              data-testid="button-confirm-selfie">
+              <Check size={16} />
+              Confirmar
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <div className="relative rounded-2xl overflow-hidden bg-black aspect-[3/4] flex items-center justify-center">
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted
+              className="w-full h-full object-cover"
+              style={{ transform: "scaleX(-1)" }}
+              data-testid="video-selfie-camera"
+            />
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+              <div className={`w-48 h-60 rounded-[50%] border-[3px] ${
+                detecting ? (faceDetected ? "border-green-400" : "border-red-400") : "border-white/60"
+              } transition-colors duration-300`} />
+            </div>
+
+            {!cameraReady && (
+              <div className="absolute inset-0 bg-gray-900 flex items-center justify-center">
+                <div className="text-center">
+                  <div className="animate-spin w-8 h-8 border-4 border-white/20 border-t-white rounded-full mx-auto mb-2" />
+                  <p className="text-white/60 text-xs">Iniciando câmera...</p>
+                </div>
+              </div>
+            )}
+
+            {cameraReady && detecting && (
+              <div className={`absolute bottom-3 left-1/2 -translate-x-1/2 px-3 py-1 rounded-full text-xs font-medium ${
+                faceDetected ? "bg-green-500/90 text-white" : "bg-red-500/90 text-white"
+              }`}>
+                {faceDetected ? "Rosto detectado ✓" : "Posicione seu rosto"}
+              </div>
+            )}
+          </div>
+
+          <button
+            onClick={handleCapture}
+            disabled={!cameraReady || !canCapture}
+            className="w-full py-3.5 bg-green-900 text-white rounded-2xl font-bold flex items-center justify-center gap-2 disabled:opacity-40 transition-all active:scale-[0.98]"
+            data-testid="button-capture-selfie"
+          >
+            <Camera size={18} />
+            {detecting && !faceDetected ? "Posicione seu rosto para capturar" : "Capturar foto"}
+          </button>
+        </div>
+      )}
+
+      <canvas ref={canvasRef} className="hidden" />
+    </div>
+  );
+}
